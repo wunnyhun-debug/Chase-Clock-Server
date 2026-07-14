@@ -1,52 +1,17 @@
--- Run this once in your Supabase project's SQL Editor (Supabase dashboard → SQL Editor → New query → paste → Run).
--- Creates everything ChaseClock's server needs. No Supabase Auth used — the sync code itself is the credential,
--- so these tables are only ever touched by the server (using the service role key), never directly by the browser.
-
-create extension if not exists pgcrypto;
-
-create table if not exists sync_accounts (
-  code_hash   text primary key,
-  settings    jsonb not null default '{}'::jsonb,
-  log         jsonb not null default '{}'::jsonb,
-  created_at  timestamptz not null default now(),
-  updated_at  timestamptz not null default now()
-);
-
-create table if not exists push_subscriptions (
-  id          uuid primary key default gen_random_uuid(),
-  code_hash   text not null references sync_accounts(code_hash) on delete cascade,
-  endpoint    text not null unique,
-  subscription jsonb not null,
-  timezone    text not null default 'UTC',
-  created_at  timestamptz not null default now()
-);
-
-create table if not exists push_state (
-  code_hash   text not null references sync_accounts(code_hash) on delete cascade,
-  date        text not null,
-  main_in     boolean not null default false,
-  early_in    boolean not null default false,
-  main_out    boolean not null default false,
-  early_out   boolean not null default false,
-  primary key (code_hash, date)
-);
-
-create table if not exists pending_nudges (
-  id          uuid primary key default gen_random_uuid(),
-  code_hash   text not null references sync_accounts(code_hash) on delete cascade,
-  type        text not null,
-  due_at      timestamptz not null,
-  sent        boolean not null default false,
-  created_at  timestamptz not null default now()
-);
-
-create index if not exists idx_push_subs_code on push_subscriptions(code_hash);
-create index if not exists idx_pending_nudges_code on pending_nudges(code_hash, sent);
-
--- Row Level Security stays ON with no policies for anon/authenticated roles.
--- That means the public API key CANNOT read or write these tables at all —
--- only the server, using the service role key (which bypasses RLS), can touch them.
-alter table sync_accounts enable row level security;
-alter table push_subscriptions enable row level security;
-alter table push_state enable row level security;
-alter table pending_nudges enable row level security;
+{
+  "name": "chaseclock-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sync + push notification server for ChaseClock",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "web-push": "^3.6.7"
+  }
+}
