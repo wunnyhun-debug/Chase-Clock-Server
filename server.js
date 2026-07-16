@@ -4,6 +4,13 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // ---------- config ----------
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -70,11 +77,17 @@ app.post('/sync/create', async (req, res) => {
 
 app.post('/sync/pull', async (req, res) => {
   try {
-    const { code } = req.body;
+    const { code, todayKey } = req.body;
     if (!code) return res.status(400).json({ error: 'missing code' });
-    const rows = await sb(`sync_accounts?code_hash=eq.${hashCode(code)}&select=settings,log`);
+    const codeHash = hashCode(code);
+    const rows = await sb(`sync_accounts?code_hash=eq.${codeHash}&select=settings,log`);
     if (!rows || !rows.length) return res.status(404).json({ error: 'code not found' });
-    res.json({ settings: rows[0].settings, log: rows[0].log });
+    let pushState = null;
+    if (todayKey) {
+      const stateRows = await sb(`push_state?code_hash=eq.${codeHash}&date=eq.${todayKey}`);
+      pushState = (stateRows && stateRows[0]) || null;
+    }
+    res.json({ settings: rows[0].settings, log: rows[0].log, pushState });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'sync failed' });
@@ -184,7 +197,7 @@ app.get('/tick', async (req, res) => {
   const now = new Date();
   let checked = 0, sent = 0;
   try {
-    const accounts = await sb('sync_accounts?select=code_hash,settings');
+    const accounts = await sb('sync_accounts?select=code_hash,settings,log');
 
     for (const acc of accounts || []) {
       checked++;
@@ -201,13 +214,15 @@ app.get('/tick', async (req, res) => {
         const nowMin = hmInZone(now, tz);
         const dow = dowInZone(now, tz);
         const isActiveDay = !st.activeDays || st.activeDays.includes(dow);
+        const todayLog = (acc.log && acc.log[today]) || {};
 
         const stateRows = await sb(`push_state?code_hash=eq.${codeHash}&date=eq.${today}`);
-        const state = (stateRows && stateRows[0]) || { main_in: false, early_in: false, main_out: false, early_out: false };
+        const state = (stateRows && stateRows[0]) || { early_in: false, early_out: false, main_in_last_sent: null, main_out_last_sent: null };
         let stateChanged = false;
 
-        const fireIfDue = async (stateKey, timeStr, body, tag) => {
+        const fireOnceIfDue = async (stateKey, timeStr, body, tag, logType) => {
           if (!isActiveDay || !timeStr || state[stateKey]) return;
+          if (todayLog[logType] && todayLog[logType].time) return;
           const [h, m] = timeStr.split(':').map(Number);
           if (nowMin >= h * 60 + m) {
             const ok = await sendPushToAccount(codeHash, { title: 'ChaseClock', body, tag });
@@ -215,24 +230,43 @@ app.get('/tick', async (req, res) => {
           }
         };
 
+        const fireRepeatingIfDue = async (lastSentKey, timeStr, body, tag, logType) => {
+          if (!isActiveDay || !timeStr) return;
+          if (todayLog[logType] && todayLog[logType].time) return;
+          const [h, m] = timeStr.split(':').map(Number);
+          const schedMin = h * 60 + m;
+          if (nowMin < schedMin || nowMin > schedMin + 180) return;
+
+          const lastSent = state[lastSentKey] ? new Date(state[lastSentKey]).getTime() : null;
+          const repeatMs = Math.max(1, st.snoozeMinutes || 10) * 60000;
+          if (lastSent && now.getTime() - lastSent < repeatMs) return;
+
+          const ok = await sendPushToAccount(codeHash, { title: 'ChaseClock', body, tag });
+          if (ok) { state[lastSentKey] = now.toISOString(); stateChanged = true; sent++; }
+        };
+
         if (isActiveDay) {
           if (st.earlyInMinutes > 0 && st.clockInTime) {
             const [h, m] = st.clockInTime.split(':').map(Number);
-            await fireIfDue('early_in', minutesToHHMM(h * 60 + m - st.earlyInMinutes), "Clock-in's coming up — pop in when you get a sec.", 'earlyIn');
+            await fireOnceIfDue('early_in', minutesToHHMM(h * 60 + m - st.earlyInMinutes), "Clock-in's coming up — pop in when you get a sec.", 'earlyIn', 'clockIn');
           }
-          await fireIfDue('main_in', st.clockInTime, 'Time to clock in.', 'mainIn');
+          await fireRepeatingIfDue('main_in_last_sent', st.clockInTime, 'Time to clock in.', 'mainIn', 'clockIn');
           if (st.earlyOutMinutes > 0 && st.clockOutTime) {
             const [h, m] = st.clockOutTime.split(':').map(Number);
-            await fireIfDue('early_out', minutesToHHMM(h * 60 + m - st.earlyOutMinutes), "Clock-out's coming up soon.", 'earlyOut');
+            await fireOnceIfDue('early_out', minutesToHHMM(h * 60 + m - st.earlyOutMinutes), "Clock-out's coming up soon.", 'earlyOut', 'clockOut');
           }
-          await fireIfDue('main_out', st.clockOutTime, 'Hey, forgot to clock out or something?', 'mainOut');
+          await fireRepeatingIfDue('main_out_last_sent', st.clockOutTime, 'Hey, forgot to clock out or something?', 'mainOut', 'clockOut');
         }
 
         if (stateChanged) {
           await sb('push_state?on_conflict=code_hash,date', {
             method: 'POST',
             headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-            body: JSON.stringify({ code_hash: codeHash, date: today, ...state }),
+            body: JSON.stringify({
+              code_hash: codeHash, date: today,
+              early_in: state.early_in, early_out: state.early_out,
+              main_in_last_sent: state.main_in_last_sent, main_out_last_sent: state.main_out_last_sent,
+            }),
           }).catch((e) => console.error('state save failed', codeHash, e));
         }
 
