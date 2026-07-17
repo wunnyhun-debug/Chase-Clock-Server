@@ -12,7 +12,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- config ----------
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY;
@@ -25,7 +24,6 @@ for (const [name, val] of Object.entries({ SUPABASE_URL, SERVICE_KEY, VAPID_PUBL
 }
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
 
-// ---------- supabase REST helper ----------
 async function sb(path, options = {}) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     ...options,
@@ -44,12 +42,11 @@ async function sb(path, options = {}) {
   return ct.includes('application/json') ? res.json() : null;
 }
 
-// ---------- sync code helpers ----------
 function hashCode(code) {
   return crypto.createHash('sha256').update(String(code).trim().toUpperCase()).digest('hex');
 }
 function generateCode() {
-  const charset = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I to avoid mix-ups
+  const charset = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = crypto.randomBytes(16);
   let code = '';
   for (let i = 0; i < 16; i++) {
@@ -59,7 +56,6 @@ function generateCode() {
   return code;
 }
 
-// ---------- sync endpoints ----------
 app.post('/sync/create', async (req, res) => {
   try {
     const code = generateCode();
@@ -151,7 +147,21 @@ app.post('/sync/schedule-nudge', async (req, res) => {
   }
 });
 
-// ---------- time helpers (all timezone-aware, using the subscribing device's IANA zone) ----------
+app.post('/sync/test-push', async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'missing code' });
+    const codeHash = hashCode(code);
+    const subRows = await sb(`push_subscriptions?code_hash=eq.${codeHash}&select=endpoint`);
+    if (!subRows || !subRows.length) return res.status(404).json({ error: 'no push subscription found for this code on this server' });
+    const ok = await sendPushToAccount(codeHash, { title: 'ChaseClock test', body: 'If you see this, real push notifications are working.', tag: 'test-push' });
+    res.json({ ok, subscriptionCount: subRows.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'test push failed' });
+  }
+});
+
 function ymdInZone(date, tz) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
 }
@@ -190,7 +200,6 @@ async function sendPushToAccount(codeHash, payload) {
   return sentAny;
 }
 
-// ---------- the tick: called every minute by an external cron pinger ----------
 app.get('/tick', async (req, res) => {
   if (TICK_SECRET && req.query.secret !== TICK_SECRET) return res.status(401).json({ error: 'unauthorized' });
 
